@@ -1,24 +1,24 @@
 <#
 Smoke test: builds a fake "share" as a plain local folder, a repo, and a snapshot dir under
-$env:TEMP, then exercises pull, plan, push, and the abort paths. Never touches a real share.
+the temp folder, then exercises pull, plan, push, and the abort paths. Never touches a real share.
 Run:  pwsh -File tests\Smoke.ps1
 #>
 #Requires -Version 7.2
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$root  = Join-Path $env:TEMP ("syncshare-smoke-" + (Get-Date -Format yyyyMMdd-HHmmss))
+$root  = Join-Path ([IO.Path]::GetTempPath()) ("syncshare-smoke-" + (Get-Date -Format yyyyMMdd-HHmmss))
 $share = Join-Path $root 'share'
 $snap  = Join-Path $root 'snap'
 $repo  = Join-Path $root 'repo'
-$mod   = Join-Path $PSScriptRoot '..\SyncShare.psm1'
+$mod   = Join-Path $PSScriptRoot '..' 'SyncShare.psm1'
 foreach ($d in $share, $snap, $repo, (Join-Path $share 'Reference')) { $null = New-Item -ItemType Directory -Force -Path $d }
 
 # seed the fake share, including things the tool must ignore
 'alpha v1'   | Set-Content -NoNewline (Join-Path $share 'alpha.txt')
 $null = New-Item -ItemType Directory -Force -Path (Join-Path $share 'sub')
-'beta v1'    | Set-Content -NoNewline (Join-Path $share 'sub\beta.txt')
-'big ref'    | Set-Content -NoNewline (Join-Path $share 'Reference\ref.bin')
+'beta v1'    | Set-Content -NoNewline (Join-Path $share 'sub' 'beta.txt')
+'big ref'    | Set-Content -NoNewline (Join-Path $share 'Reference' 'ref.bin')
 'ignore me'  | Set-Content -NoNewline (Join-Path $share 'Thumbs.db')
 
 # repo with an initial commit on main
@@ -48,16 +48,16 @@ Step 'pull 1: share into main' {
 Step 'local edit, add, delete; plan; push' {
     'alpha v2' | Set-Content -NoNewline (Join-Path $repo 'alpha.txt')
     'gamma v1' | Set-Content -NoNewline (Join-Path $repo 'gamma.txt')
-    Remove-Item (Join-Path $repo 'sub\beta.txt')
+    Remove-Item (Join-Path $repo 'sub' 'beta.txt')
     & git -C $repo add -A; & git -C $repo commit -q -m 'edits'
     $plan = Get-SyncPlan -ConfigPath $cfgPath
     Invoke-SharePush -PlanPath $plan -ConfigPath $cfgPath -Confirm:$false
     if ((Get-Content (Join-Path $share 'alpha.txt') -Raw) -ne 'alpha v2') { throw 'alpha not pushed' }
     if (-not (Test-Path (Join-Path $share 'gamma.txt')))                    { throw 'gamma not added' }
-    if (Test-Path (Join-Path $share 'sub\beta.txt'))                        { throw 'beta not removed' }
+    if (Test-Path (Join-Path $share 'sub' 'beta.txt'))                        { throw 'beta not removed' }
     $trashed = Get-ChildItem (Join-Path $share '_sync_trash') -Recurse -File
     if ($trashed.Count -ne 2) { throw "expected 2 trashed files (alpha v1, beta v1), got $($trashed.Count)" }
-    if (Test-Path (Join-Path $share 'Reference\ref.bin') -PathType Leaf -ErrorAction Stop) { } else { throw 'reference file disturbed' }
+    if (Test-Path (Join-Path $share 'Reference' 'ref.bin') -PathType Leaf -ErrorAction Stop) { } else { throw 'reference file disturbed' }
 }
 
 Step 'coworker edits share after baseline: plan must refuse (exit 30)' {
@@ -82,18 +82,21 @@ Step 'pull 2: expect a conflict on alpha.txt (exit 20), resolve, complete' {
 }
 
 Step 'held-open file aborts the push and restores state' {
+    if (-not $IsWindows) { Write-Host '   skipped: share-mode locking is only enforced on Windows'; return }
     'alpha v5' | Set-Content -NoNewline (Join-Path $repo 'alpha.txt')
     & git -C $repo commit -q -am 'v5'
     $plan = Get-SyncPlan -ConfigPath $cfgPath
     $fs = [IO.File]::Open((Join-Path $share 'alpha.txt'), 'Open', 'Read', 'None')   # exclusive handle
     try {
-        $failed = $false
-        try { Invoke-SharePush -PlanPath $plan -ConfigPath $cfgPath -Confirm:$false } catch { $failed = $true }
-        if (-not $failed) { throw 'push succeeded against a held-open file' }
+        $msg = $null
+        try { Invoke-SharePush -PlanPath $plan -ConfigPath $cfgPath -Confirm:$false } catch { $msg = $_.Exception.Message }
+        if (-not $msg)                              { throw 'push succeeded against a held-open file' }
+        if ($msg -notlike '*cannot rename*to trash*') { throw "push failed for the wrong reason: $msg" }
     } finally { $fs.Dispose() }
     if ((Get-Content (Join-Path $share 'alpha.txt') -Raw) -ne 'alpha v4 merged') { throw 'original was disturbed' }
     if (Get-ChildItem $share -Filter '*.~sync~*' -Recurse) { throw 'temp file left behind' }
     Invoke-SharePush -PlanPath (Get-SyncPlan -ConfigPath $cfgPath) -ConfigPath $cfgPath -Confirm:$false
+    if ((Get-Content (Join-Path $share 'alpha.txt') -Raw) -ne 'alpha v5') { throw 'retry after unlock did not push' }
 }
 
 Step 'path rules' {

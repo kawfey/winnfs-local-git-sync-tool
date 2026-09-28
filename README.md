@@ -82,6 +82,7 @@ The snapshot folder deliberately has no `.git` in it. Git is pointed at it throu
 | `MaxDeletes` | no | 10 | Push plan limit on deletions |
 | `MaxModifies` | no | 50 | Push plan limit on modifications |
 | `MaxChangeFraction` | no | 0.25 | Push plan limit on (deletes + modifies) / tracked files |
+| `MinFilesForFraction` | no | 20 | `MaxChangeFraction` applies only when the baseline tracks at least this many files |
 | `LogPath` | no | `./logs` | Rolling log and robocopy logs |
 | `PlanPath` | no | `./plans` | Push plan JSON files and their SHA-256 sidecars |
 
@@ -187,7 +188,7 @@ The local repository is the durable history. Back it up off the machine, for exa
 pwsh -File tests\Smoke.ps1
 ```
 
-Builds a throwaway share, repo, and snapshot under `$env:TEMP` and exercises pull, push, the compare-and-swap refusal, a conflicted pull and its resolution, a held-open file aborting a push with the original intact, and the path rules. It never touches a real share.
+Builds a throwaway share, repo, and snapshot under `$env:TEMP` and exercises pull, push, the compare-and-swap refusal, a conflicted pull and its resolution, a held-open file aborting a push with the original intact, and the path rules. It never touches a real share. The held-open step runs only on Windows, since share-mode locking is not enforced elsewhere.
 
 The default run uses a plain local folder as the "share", which tests the logic but not SMB share-mode enforcement. For that, share the same folder over loopback (`net share smoke=<path> /grant:%USERNAME%,FULL` as administrator) and point `$share` in the script at `\\localhost\smoke`.
 

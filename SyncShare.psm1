@@ -20,13 +20,16 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $script:ToolVersion = '0.1.0'
 $script:BaselineRef = 'refs/sync/share-baseline'
+$script:Sep = [IO.Path]::DirectorySeparatorChar
 $script:ShareBranch = 'share'
 
 # --------------------------------------------------------------------------- config
 
 function Get-SyncConfig {
-    [CmdletBinding()] param([string]$Path = (Join-Path $PSScriptRoot 'config.json'))
-    $c = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json -AsHashtable
+    [CmdletBinding()] param([string]$ConfigPath)
+    if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot 'config.json' }
+    $ConfigPath = (Resolve-Path -LiteralPath $ConfigPath -ErrorAction Stop).ProviderPath
+    $c = Get-Content -Raw -LiteralPath $ConfigPath | ConvertFrom-Json -AsHashtable
     foreach ($k in 'SharePath','SnapshotPath','RepoPath') {
         if (-not $c.ContainsKey($k)) { throw "config: '$k' is required" }
     }
@@ -38,6 +41,7 @@ function Get-SyncConfig {
         MaxDeletes          = 10         # push thresholds
         MaxModifies         = 50
         MaxChangeFraction   = 0.25
+        MinFilesForFraction = 20         # fraction limit applies only at or above this tree size
         LogPath             = (Join-Path $PSScriptRoot 'logs')
         PlanPath            = (Join-Path $PSScriptRoot 'plans')
     }
@@ -45,6 +49,13 @@ function Get-SyncConfig {
     foreach ($d in $c.LogPath, $c.PlanPath) { $null = New-Item -ItemType Directory -Force -Path $d }
     $c.ExcludeDirs = @($c.ExcludeDirs) + $c.TrashDirName
     return $c
+}
+
+# --------------------------------------------------------------------------- run ids
+
+function New-RunSuffix {
+    # millisecond timestamp plus random suffix: two runs in the same second must not share a trash folder
+    '{0}-{1}' -f (Get-Date -Format yyyyMMdd-HHmmss-fff), ([guid]::NewGuid().ToString('N').Substring(0, 4))
 }
 
 # --------------------------------------------------------------------------- logging
@@ -99,7 +110,7 @@ function Get-GitRef {
 
 function Get-BlobHash {
     param([Parameter(Mandatory)][string]$LiteralPath)
-    (Invoke-Git -GitArgs @('hash-object','--no-filters','--', $LiteralPath) -join '').Trim()
+    ((Invoke-Git -GitArgs @('hash-object','--no-filters','--', $LiteralPath)) -join '').Trim()
 }
 
 function Assert-RepoSettings {
@@ -112,7 +123,7 @@ function Assert-RepoSettings {
 function Initialize-SyncRepo {
     <# One-time: pins the byte-fidelity settings on the local repo. #>
     [CmdletBinding()] param([string]$ConfigPath)
-    $script:Cfg = Get-SyncConfig @PSBoundParameters
+    $script:Cfg = Get-SyncConfig -ConfigPath $ConfigPath
     foreach ($pair in @(@('core.autocrlf','false'), @('core.safecrlf','false'), @('core.longpaths','true'), @('core.ignorecase','true'))) {
         $null = Invoke-Git -GitArgs @('config','--local', $pair[0], $pair[1])
     }
@@ -177,10 +188,10 @@ function Invoke-SnapshotCopy {
 function Assert-SnapshotSane {
     param([Parameter(Mandatory)][string]$RunId)
     $c = $script:Cfg
-    $root = $c.SnapshotPath.TrimEnd('\')
+    $root = $c.SnapshotPath.TrimEnd('\','/')
     $items = Get-ChildItem -LiteralPath $root -Recurse -Force
     foreach ($i in $items) {
-        $rel = $i.FullName.Substring($root.Length + 1) -replace '\\','/'
+        $rel = $i.FullName.Substring($root.Length + 1).Replace([string]$script:Sep, '/')
         if ($i.PSIsContainer) {
             if ($i.Name -ieq '.git') { throw "embedded repository at '$rel' on the share (exit 11)" }
             continue
@@ -197,7 +208,7 @@ function Write-ShareSnapshotCommit {
     <# Commits SnapshotPath onto refs/heads/share using a private index. Returns the commit id. #>
     param([Parameter(Mandatory)][string]$RunId, [string]$Message)
     $c = $script:Cfg
-    $idx = Join-Path $c.RepoPath '.git\share.index'
+    $idx = Join-Path $c.RepoPath '.git' 'share.index'
     $null = Invoke-Git -GitArgs @('read-tree','--empty') -WorkTree $c.SnapshotPath -IndexFile $idx
     $null = Invoke-Git -GitArgs @('add','-A','-f','--','.') -WorkTree $c.SnapshotPath -IndexFile $idx
     $tree   = (Invoke-Git -GitArgs @('write-tree') -WorkTree $c.SnapshotPath -IndexFile $idx) -join ''
@@ -222,8 +233,8 @@ function Invoke-SharePull {
       exit 0 ok | 10 not quiescent | 11 snapshot rejected | 20 merge conflict (resolve, then Complete-SharePull)
     #>
     [CmdletBinding()] param([string]$ConfigPath)
-    $script:Cfg = Get-SyncConfig @PSBoundParameters
-    $runId = 'pull-' + (Get-Date -Format yyyyMMdd-HHmmss)
+    $script:Cfg = Get-SyncConfig -ConfigPath $ConfigPath
+    $runId = 'pull-' + (New-RunSuffix)
     Assert-RepoSettings
     Invoke-SnapshotCopy -RunId $runId
     Assert-SnapshotSane -RunId $runId
@@ -250,7 +261,7 @@ function Invoke-SharePull {
 function Complete-SharePull {
     <# After the user resolved a conflicted merge and committed it. #>
     [CmdletBinding()] param([string]$ConfigPath)
-    $script:Cfg = Get-SyncConfig @PSBoundParameters
+    $script:Cfg = Get-SyncConfig -ConfigPath $ConfigPath
     $pending = Join-Path $script:Cfg.PlanPath 'pending-pull.txt'
     if (-not (Test-Path -LiteralPath $pending)) { throw 'no pending pull' }
     $shareCommit = (Get-Content -LiteralPath $pending -Raw).Trim()
@@ -268,8 +279,8 @@ function Get-SyncPlan {
       Entries come from `git diff --raw --no-renames -z baseline main`, which carries old and new blob ids.
     #>
     [CmdletBinding()] param([string]$ConfigPath)
-    $script:Cfg = Get-SyncConfig @PSBoundParameters
-    $runId = 'plan-' + (Get-Date -Format yyyyMMdd-HHmmss)
+    $script:Cfg = Get-SyncConfig -ConfigPath $ConfigPath
+    $runId = 'plan-' + (New-RunSuffix)
     Assert-RepoSettings
     $baseline = Get-GitRef $script:BaselineRef
     if (-not $baseline) { throw 'no baseline; run Invoke-SharePull first' }
@@ -283,7 +294,7 @@ function Get-SyncPlan {
     if ($current -ne $baseline) { throw "share changed since baseline ($baseline -> $current); run Invoke-SharePull (exit 30)" }
 
     $head = Get-GitRef 'main'
-    $raw = (Invoke-Git -GitArgs @('diff','--raw','--no-renames','-z', $baseline, $head)) -join "`n"
+    $raw = (Invoke-Git -GitArgs @('diff','--raw','--no-abbrev','--no-renames','-z', $baseline, $head)) -join "`n"
     $fields = $raw.Split([char]0)
     $entries = [System.Collections.Generic.List[object]]::new()
     for ($i = 0; $i + 1 -lt $fields.Count; $i += 2) {
@@ -303,7 +314,9 @@ function Get-SyncPlan {
     $mod = @($entries | Where-Object Status -eq 'M').Count
     if ($del -gt $script:Cfg.MaxDeletes)   { throw "plan deletes $del files, above MaxDeletes (exit 31)" }
     if ($mod -gt $script:Cfg.MaxModifies)  { throw "plan modifies $mod files, above MaxModifies (exit 31)" }
-    if ($treeCount -gt 0 -and ($del + $mod) / $treeCount -gt $script:Cfg.MaxChangeFraction) { throw "plan touches $(($del+$mod)/$treeCount*100)% of tree (exit 31)" }
+    if ($treeCount -ge $script:Cfg.MinFilesForFraction -and ($del + $mod) / $treeCount -gt $script:Cfg.MaxChangeFraction) {
+        throw "plan modifies or deletes $($del + $mod) of $treeCount tracked files, above MaxChangeFraction (exit 31)"
+    }
 
     $plan = [pscustomobject]@{
         RunId=$runId; Tool=$script:ToolVersion; Baseline=$baseline; Head=$head
@@ -345,7 +358,7 @@ function Invoke-ShareEntry {
     #>
     param([Parameter(Mandatory)]$Entry, [Parameter(Mandatory)][string]$RunId)
     $c = $script:Cfg
-    $rel   = $Entry.Path -replace '/','\'
+    $rel   = $Entry.Path.Replace('/', $script:Sep)
     $dest  = Join-Path $c.SharePath $rel
     $dir   = [IO.Path]::GetDirectoryName($dest)
     $leaf  = [IO.Path]::GetFileName($dest)
@@ -396,12 +409,12 @@ function Invoke-SharePush {
     #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact='High')]
     param([Parameter(Mandatory)][string]$PlanPath, [string]$ConfigPath)
-    $script:Cfg = Get-SyncConfig -Path:$(if ($ConfigPath) { $ConfigPath } else { (Join-Path $PSScriptRoot 'config.json') })
+    $script:Cfg = Get-SyncConfig -ConfigPath $ConfigPath
     Assert-RepoSettings
     $hash = (Get-FileHash -LiteralPath $PlanPath -Algorithm SHA256).Hash
     if ((Get-Content -LiteralPath "$PlanPath.sha256" -Raw).Trim() -ne $hash) { throw 'plan file altered since Get-SyncPlan' }
     $plan = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json
-    $runId = 'push-' + (Get-Date -Format yyyyMMdd-HHmmss)
+    $runId = 'push-' + (New-RunSuffix)
 
     if ((Get-GitRef $script:BaselineRef) -ne $plan.Baseline) { throw 'baseline moved since the plan was made; re-plan' }
     if ((Get-GitRef 'main') -ne $plan.Head)                  { throw 'main moved since the plan was made; re-plan' }
@@ -412,10 +425,10 @@ function Invoke-SharePush {
 
     # tripwire: any change on the share outside the trash, temp files, and plan paths aborts the run.
     # The -Action block runs in its own scope, so state is shared through -MessageData.
-    $shareRoot = $script:Cfg.SharePath.TrimEnd('\')
+    $shareRoot = $script:Cfg.SharePath.TrimEnd('\','/')
     $ignore = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($e in $plan.Entries) {
-        $p = Join-Path $shareRoot ($e.Path -replace '/','\')
+        $p = Join-Path $shareRoot $e.Path.Replace('/', $script:Sep)
         $null = $ignore.Add($p)
         $d = [IO.Path]::GetDirectoryName($p)
         while ($d -and $d.Length -gt $shareRoot.Length) { $null = $ignore.Add($d); $d = [IO.Path]::GetDirectoryName($d) }
@@ -481,7 +494,7 @@ function Clear-SyncTrash {
     <# The only code path that deletes anything on the share, and only inside _sync_trash. #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact='High')]
     param([int]$OlderThanDays = 30, [string]$ConfigPath)
-    $script:Cfg = Get-SyncConfig -Path:$(if ($ConfigPath) { $ConfigPath } else { (Join-Path $PSScriptRoot 'config.json') })
+    $script:Cfg = Get-SyncConfig -ConfigPath $ConfigPath
     $trash = Join-Path $script:Cfg.SharePath $script:Cfg.TrashDirName
     Get-ChildItem -LiteralPath $trash -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$OlderThanDays) } |
