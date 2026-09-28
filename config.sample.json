@@ -1,0 +1,16 @@
+{
+  "SharePath":    "\\\\fileserver\\share\\Team\\Subfolder",
+  "SnapshotPath": "C:\\work\\share-snap",
+  "RepoPath":     "C:\\work\\repo",
+
+  "TrashDirName": "_sync_trash",
+
+  "ExcludeDirs":  [ "Reference" ],
+  "ExcludeFiles": [ "Thumbs.db", "~$*", "*.tmp" ],
+
+  "MaxTrackedFileBytes": 26214400,
+
+  "MaxDeletes": 10,
+  "MaxModifies": 50,
+  "MaxChangeFraction": 0.25
+}
