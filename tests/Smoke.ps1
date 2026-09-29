@@ -1,14 +1,30 @@
 <#
-Smoke test: builds a fake "share" as a plain local folder, a repo, and a snapshot dir under
-the temp folder, then exercises pull, plan, push, and the abort paths. Never touches a real share.
-Run:  pwsh -File tests\Smoke.ps1
+Smoke test: builds a throwaway "share", repo, and snapshot folder, then exercises pull, plan,
+push, and the abort paths.
+
+  pwsh -File tests\Smoke.ps1
+      share is a plain folder under the local temp folder (tests logic, not SMB)
+
+  pwsh -File tests\Smoke.ps1 -ShareRoot \\server\share\some\folder\you\own
+      share is a new, uniquely named subfolder created under ShareRoot, so renames, share
+      modes, and robocopy run over real SMB. Nothing outside that new subfolder is touched,
+      and the subfolder is left in place for you to inspect and delete.
 #>
 #Requires -Version 7.2
+param([string]$ShareRoot)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$root  = Join-Path ([IO.Path]::GetTempPath()) ("syncshare-smoke-" + (Get-Date -Format yyyyMMdd-HHmmss))
-$share = Join-Path $root 'share'
+$stamp = 'syncshare-smoke-' + (Get-Date -Format yyyyMMdd-HHmmss) + '-' + [guid]::NewGuid().ToString('N').Substring(0, 4)
+$root  = Join-Path ([IO.Path]::GetTempPath()) $stamp
+if ($ShareRoot) {
+    if (-not (Test-Path -LiteralPath $ShareRoot -PathType Container)) { throw "ShareRoot '$ShareRoot' does not exist or is not a folder" }
+    $share = Join-Path $ShareRoot $stamp
+    if (Test-Path -LiteralPath $share) { throw "'$share' already exists; refusing to reuse it" }
+    Write-Host "share under test: $share"
+} else {
+    $share = Join-Path $root 'share'
+}
 $snap  = Join-Path $root 'snap'
 $repo  = Join-Path $root 'repo'
 $mod   = Join-Path $PSScriptRoot '..' 'SyncShare.psm1'
@@ -106,4 +122,4 @@ Step 'path rules' {
     if (Test-ManagedPath 'sub/ok name (1).docx') { throw 'rejected a good path' }
 }
 
-Write-Host "`nALL STEPS PASSED  ($root)"
+Write-Host "`nALL STEPS PASSED  (local: $root; share: $share)"

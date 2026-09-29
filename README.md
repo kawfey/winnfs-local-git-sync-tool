@@ -188,9 +188,17 @@ The local repository is the durable history. Back it up off the machine, for exa
 pwsh -File tests\Smoke.ps1
 ```
 
-Builds a throwaway share, repo, and snapshot under `$env:TEMP` and exercises pull, push, the compare-and-swap refusal, a conflicted pull and its resolution, a held-open file aborting a push with the original intact, and the path rules. It never touches a real share. The held-open step runs only on Windows, since share-mode locking is not enforced elsewhere.
+Builds a throwaway share, repo, and snapshot under the temp folder and exercises pull, push, the compare-and-swap refusal, a conflicted pull and its resolution, a held-open file aborting a push with the original intact, and the path rules. The held-open step runs only on Windows, since share-mode locking is not enforced elsewhere. A `Write-Error` line during the held-open step is expected: it is the tool logging the abort that step provokes.
 
-The default run uses a plain local folder as the "share", which tests the logic but not SMB share-mode enforcement. For that, share the same folder over loopback (`net share smoke=<path> /grant:%USERNAME%,FULL` as administrator) and point `$share` in the script at `\\localhost\smoke`.
+The default run uses a plain local folder as the "share", which tests the logic but not SMB. To run the same steps over a real share without admin rights, pass a folder you can already write to:
+
+```powershell
+pwsh -File tests\Smoke.ps1 -ShareRoot \\fileserver\share\Team\Scratch
+```
+
+The test creates a new uniquely named subfolder (`syncshare-smoke-<timestamp>-<id>`) under `ShareRoot`, refuses to run if that name already exists, and works only inside it. Robocopy, renames, and the share-mode lock test then go through the SMB redirector and the file server. The subfolder is left in place afterwards so you can inspect it; delete it by hand.
+
+If you have admin rights, a loopback share (`net share smoke=<path> /grant:%USERNAME%,FULL`) passed as `-ShareRoot \\localhost\smoke` works too.
 
 ## Limitations
 
@@ -205,5 +213,5 @@ The default run uses a plain local folder as the "share", which tests the logic 
 ```
 SyncShare.psm1         the module
 config.sample.json     configuration template
-tests/Smoke.ps1        end-to-end test against a temporary folder
+tests/Smoke.ps1        end-to-end test against a temporary folder or a scratch folder on a share
 ```
